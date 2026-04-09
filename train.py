@@ -333,6 +333,8 @@ def main():
     parser.add_argument("--warmup_steps",      type=int,   default=50)
     parser.add_argument("--max_steps",         type=int,   default=100_000)
     parser.add_argument("--time_limit_min",    type=float, default=10.0)
+    parser.add_argument("--fp8", action="store_true", default=False,
+                        help="Enable torchao FP8 training on nn.Linear layers (B300/H100+)")
     args = parser.parse_args()
 
     cfg = Config(
@@ -384,6 +386,35 @@ def main():
         print(f"[model] {n_params/1e6:.1f}M parameters (dense GPT, GQA + SwiGLU)",
               flush=True)
         print(f"[cluster] world_size={world_size}, device={device}", flush=True)
+
+    # Optional FP8 training via torchao — must run BEFORE DDP wrap so the
+    # Float8Linear modules are registered as the DDP parameters.
+    if args.fp8:
+        try:
+            from torchao.float8 import convert_to_float8_training, Float8LinearConfig
+            try:
+                fp8_config = Float8LinearConfig.from_recipe_name("rowwise")
+            except Exception:
+                fp8_config = Float8LinearConfig.from_recipe_name("tensorwise")
+            # Convert only nn.Linear — skip embeddings, lm_head, and norms
+            convert_to_float8_training(
+                model,
+                config=fp8_config,
+                module_filter_fn=lambda m, fqn: isinstance(m, nn.Linear)
+                    and "lm_head" not in fqn
+                    and "embed" not in fqn
+                    and "norm" not in fqn,
+            )
+            if master:
+                print(f"[fp8] enabled via torchao ({type(fp8_config).__name__})",
+                      flush=True)
+        except ImportError:
+            if master:
+                print("[fp8] torchao not installed — skipping (`pip install torchao`)",
+                      flush=True)
+        except Exception as e:
+            if master:
+                print(f"[fp8] conversion failed: {e}", flush=True)
 
     if ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)

@@ -1,5 +1,5 @@
 """
-Dense GPT with GQA, RoPE, QK-norm, RMSNorm, SwiGLU.
+Dense GPT with GQA, RoPE, QK-norm, RMSNorm, Squared-ReLU GLU.
 
 Self-contained — no external framework imports beyond torch.
 
@@ -7,7 +7,7 @@ Architecture:
     - Token embedding + weight-tied lm_head
     - N × Transformer block:
         RMSNorm → GQA attention (RoPE + QK-norm) → residual
-        RMSNorm → SwiGLU MLP → residual
+        RMSNorm → Squared-ReLU GLU (gate²·up → down) → residual
     - RMSNorm → logits
 
 Sized for ~111M params (n_embd=768, 12 layers, inter=2432).
@@ -120,7 +120,14 @@ class GQA(nn.Module):
 # Dense SwiGLU MLP
 # ---------------------------------------------------------------------------
 
-class SwiGLU(nn.Module):
+class SquaredReluGLU(nn.Module):
+    """Gated MLP with squared-ReLU activation on the gate branch.
+
+    Replaces SwiGLU's SiLU with ReLU² (no exponential, slightly faster,
+    equivalent or better convergence at this scale). Used in Primer and
+    several Parameter Golf recipes.
+    """
+
     def __init__(self, n_embd: int, intermediate_size: int):
         super().__init__()
         self.gate_proj = nn.Linear(n_embd, intermediate_size, bias=False)
@@ -128,7 +135,7 @@ class SwiGLU(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(F.relu(self.gate_proj(x)).square() * self.up_proj(x))
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +149,7 @@ class Block(nn.Module):
         self.input_norm = RMSNorm(n_embd)
         self.attn = GQA(n_embd, n_head, n_kv_head, max_seq_len)
         self.post_attn_norm = RMSNorm(n_embd)
-        self.mlp = SwiGLU(n_embd, intermediate_size)
+        self.mlp = SquaredReluGLU(n_embd, intermediate_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.input_norm(x))

@@ -45,15 +45,13 @@ class Config:
     token_dtype: str = "uint16"
     seq_len:     int = 1024
 
-    # Model — ~111M params target
-    vocab_size:               int = 32768
-    n_layer:                  int = 12
-    n_head:                   int = 12
-    n_kv_head:                int = 4
-    n_embd:                   int = 768
-    intermediate_size:        int = 2048
-    num_experts:              int = 4
-    shared_intermediate_size: int = 384
+    # Model — ~111M params target (dense GPT with GQA + SwiGLU)
+    vocab_size:        int = 32768
+    n_layer:           int = 12
+    n_head:            int = 12
+    n_kv_head:         int = 4
+    n_embd:            int = 768
+    intermediate_size: int = 2432
 
     # Training
     batch_size:       int   = 16
@@ -327,9 +325,7 @@ def main():
     parser.add_argument("--n_head",            type=int,   default=12)
     parser.add_argument("--n_kv_head",         type=int,   default=4)
     parser.add_argument("--n_embd",            type=int,   default=768)
-    parser.add_argument("--intermediate_size", type=int,   default=2048)
-    parser.add_argument("--num_experts",       type=int,   default=4)
-    parser.add_argument("--shared_intermediate_size", type=int, default=384)
+    parser.add_argument("--intermediate_size", type=int,   default=2432)
     parser.add_argument("--batch_size",        type=int,   default=16)
     parser.add_argument("--grad_accum_steps",  type=int,   default=2)
     parser.add_argument("--muon_lr",           type=float, default=0.02)
@@ -340,24 +336,22 @@ def main():
     args = parser.parse_args()
 
     cfg = Config(
-        data_dir                 = args.data_dir,
-        checkpoint_path          = args.checkpoint_path,
-        seq_len                  = args.seq_len,
-        vocab_size               = args.vocab_size,
-        n_layer                  = args.n_layer,
-        n_head                   = args.n_head,
-        n_kv_head                = args.n_kv_head,
-        n_embd                   = args.n_embd,
-        intermediate_size        = args.intermediate_size,
-        num_experts              = args.num_experts,
-        shared_intermediate_size = args.shared_intermediate_size,
-        batch_size               = args.batch_size,
-        grad_accum_steps         = args.grad_accum_steps,
-        muon_lr                  = args.muon_lr,
-        max_lr                   = args.adam_lr,
-        warmup_steps             = args.warmup_steps,
-        max_steps                = args.max_steps,
-        time_limit_seconds       = args.time_limit_min * 60,
+        data_dir           = args.data_dir,
+        checkpoint_path    = args.checkpoint_path,
+        seq_len            = args.seq_len,
+        vocab_size         = args.vocab_size,
+        n_layer            = args.n_layer,
+        n_head             = args.n_head,
+        n_kv_head          = args.n_kv_head,
+        n_embd             = args.n_embd,
+        intermediate_size  = args.intermediate_size,
+        batch_size         = args.batch_size,
+        grad_accum_steps   = args.grad_accum_steps,
+        muon_lr            = args.muon_lr,
+        max_lr             = args.adam_lr,
+        warmup_steps       = args.warmup_steps,
+        max_steps          = args.max_steps,
+        time_limit_seconds = args.time_limit_min * 60,
     )
 
     # ------------------------------------------------------------------ DDP
@@ -387,8 +381,8 @@ def main():
     model = get_model(asdict(cfg)).to(device)
     if master:
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"[model] {n_params/1e6:.1f}M parameters "
-              f"(Token-Routed {cfg.num_experts} experts + shared)", flush=True)
+        print(f"[model] {n_params/1e6:.1f}M parameters (dense GPT, GQA + SwiGLU)",
+              flush=True)
         print(f"[cluster] world_size={world_size}, device={device}", flush=True)
 
     if ddp:
@@ -405,9 +399,9 @@ def main():
         nesterov=True,
         ns_steps=5,
         weight_decay=cfg.weight_decay,
-        expert_lr_scale=1.5,
-        expert_weight_decay=cfg.expert_weight_decay,
-        num_experts=cfg.num_experts,
+        expert_lr_scale=1.0,
+        expert_weight_decay=cfg.weight_decay,
+        num_experts=1,  # no routed experts in dense model
     )
     adam = torch.optim.AdamW(
         adam_groups,
@@ -433,14 +427,6 @@ def main():
     model.train()
     for g in muon.param_groups: g["lr_base"] = g["lr"]
     for g in adam.param_groups: g["lr_base"] = g["lr"]
-
-    # Reset token counts every step (for the adaptive LR controller)
-    def update_token_counts(batch_ids: torch.Tensor):
-        flat = batch_ids.view(-1)
-        flat = flat[flat < cfg.vocab_size]
-        experts = flat % cfg.num_experts
-        counts = torch.bincount(experts, minlength=cfg.num_experts)
-        muon.update_token_counts(counts)
 
     train_start = time.time()
     muon.zero_grad(set_to_none=True)
@@ -470,7 +456,6 @@ def main():
         accumulated_loss = 0.0
         for micro in range(cfg.grad_accum_steps):
             x, y = dataset.get_batch(cfg.batch_size, device)
-            update_token_counts(x)
             sync_ctx = (model.no_sync()
                         if (ddp and micro < cfg.grad_accum_steps - 1)
                         else nullcontext())

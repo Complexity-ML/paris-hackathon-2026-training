@@ -1,17 +1,17 @@
 """
-Token-Routed MoE with deterministic Zipf routing + shared expert.
+Dense GPT with GQA, RoPE, QK-norm, RMSNorm, SwiGLU.
 
 Self-contained — no external framework imports beyond torch.
 
 Architecture:
-    - Embedding + weight-tied lm_head
+    - Token embedding + weight-tied lm_head
     - N × Transformer block:
-        RMSNorm → GQA attention (RoPE) → residual
-        RMSNorm → Token-Routed MLP (shared SwiGLU + 4 routed experts) → residual
+        RMSNorm → GQA attention (RoPE + QK-norm) → residual
+        RMSNorm → SwiGLU MLP → residual
     - RMSNorm → logits
 
-Routing: deterministic expert_id = token_id % num_experts (no learned router).
-         Uses masked-loop dispatch (autograd-friendly, no custom Triton backward).
+Sized for ~111M params (n_embd=768, 12 layers, inter=2432).
+Aligned with the MuonTR training script and the 10-minute budget.
 
 Contract:
     get_model(config: dict) -> nn.Module
@@ -44,7 +44,6 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _apply_rope(q: torch.Tensor, k: torch.Tensor,
                 cos: torch.Tensor, sin: torch.Tensor):
-    # q, k: [B, H, T, D]; cos, sin: [T, D]
     cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
     return (q * cos + _rotate_half(q) * sin,
@@ -85,7 +84,7 @@ class GQA(nn.Module):
         self.v_proj = nn.Linear(n_embd, kv_dim, bias=False)
         self.o_proj = nn.Linear(n_embd, n_embd, bias=False)
 
-        # QK norm — stabilizes training at scale
+        # QK norm — stabilizes training
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
 
@@ -107,7 +106,6 @@ class GQA(nn.Module):
         sin = self.rope_sin[:T].to(q.dtype)
         q, k = _apply_rope(q, k, cos, sin)
 
-        # GQA: broadcast k/v to q's head count
         if self.n_kv_head < self.n_head:
             repeat = self.n_head // self.n_kv_head
             k = k.repeat_interleave(repeat, dim=1)
@@ -119,77 +117,18 @@ class GQA(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Token-Routed MLP with shared expert
+# Dense SwiGLU MLP
 # ---------------------------------------------------------------------------
 
-class TokenRoutedMLP(nn.Module):
-    """
-    Deterministic token-routed MoE:
-        expert_id = token_id % num_experts
-    Each expert is a SwiGLU slice; a dense shared SwiGLU is added on top
-    and processes all tokens unconditionally.
-
-    Dispatch: masked loop over experts (autograd-friendly, no custom kernel).
-    """
-
-    def __init__(self, n_embd: int, intermediate_size: int, num_experts: int,
-                 shared_intermediate_size: int, vocab_size: int):
+class SwiGLU(nn.Module):
+    def __init__(self, n_embd: int, intermediate_size: int):
         super().__init__()
-        self.num_experts = num_experts
-        self.n_embd = n_embd
-        self.expert_dim = intermediate_size // num_experts
-        self.vocab_size = vocab_size
+        self.gate_proj = nn.Linear(n_embd, intermediate_size, bias=False)
+        self.up_proj   = nn.Linear(n_embd, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, n_embd, bias=False)
 
-        # Routed expert weights, kept as 3D tensors for slicing speed
-        self.gate_proj_w = nn.Parameter(
-            torch.randn(num_experts, n_embd, self.expert_dim) * 0.02
-        )
-        self.up_proj_w = nn.Parameter(
-            torch.randn(num_experts, n_embd, self.expert_dim) * 0.02
-        )
-        self.down_proj_w = nn.Parameter(
-            torch.randn(num_experts, self.expert_dim, n_embd) * 0.02
-        )
-
-        # Shared expert — dense SwiGLU
-        self.shared_gate = nn.Linear(n_embd, shared_intermediate_size, bias=False)
-        self.shared_up = nn.Linear(n_embd, shared_intermediate_size, bias=False)
-        self.shared_down = nn.Linear(shared_intermediate_size, n_embd, bias=False)
-
-        # Deterministic token → expert mapping
-        self.register_buffer(
-            "token_to_expert",
-            torch.arange(vocab_size, dtype=torch.long) % num_experts,
-            persistent=False,
-        )
-
-    def forward(self, x: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        B, T, H = x.shape
-
-        # Route each token by its input id
-        expert_ids = self.token_to_expert[token_ids.clamp(0, self.vocab_size - 1)]  # [B, T]
-        flat_x = x.view(-1, H)
-        flat_expert_ids = expert_ids.view(-1)
-
-        # Shared expert — runs on every token
-        shared_out = self.shared_down(
-            F.silu(self.shared_gate(flat_x)) * self.shared_up(flat_x)
-        )
-
-        # Routed experts — masked loop (autograd friendly)
-        routed_out = torch.zeros_like(flat_x)
-        for e in range(self.num_experts):
-            mask = flat_expert_ids == e
-            if not mask.any():
-                continue
-            x_e = flat_x[mask]
-            gate_e = x_e @ self.gate_proj_w[e]
-            up_e = x_e @ self.up_proj_w[e]
-            inter_e = F.silu(gate_e) * up_e
-            routed_out[mask] = (inter_e @ self.down_proj_w[e]).to(routed_out.dtype)
-
-        out = routed_out + shared_out
-        return out.view(B, T, H)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ---------------------------------------------------------------------------
@@ -198,29 +137,24 @@ class TokenRoutedMLP(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, n_embd: int, n_head: int, n_kv_head: int,
-                 intermediate_size: int, num_experts: int,
-                 shared_intermediate_size: int, vocab_size: int,
-                 max_seq_len: int):
+                 intermediate_size: int, max_seq_len: int):
         super().__init__()
         self.input_norm = RMSNorm(n_embd)
         self.attn = GQA(n_embd, n_head, n_kv_head, max_seq_len)
         self.post_attn_norm = RMSNorm(n_embd)
-        self.mlp = TokenRoutedMLP(
-            n_embd, intermediate_size, num_experts,
-            shared_intermediate_size, vocab_size,
-        )
+        self.mlp = SwiGLU(n_embd, intermediate_size)
 
-    def forward(self, x: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.input_norm(x))
-        x = x + self.mlp(self.post_attn_norm(x), token_ids)
+        x = x + self.mlp(self.post_attn_norm(x))
         return x
 
 
 # ---------------------------------------------------------------------------
-# Token-Routed GPT
+# Dense GPT
 # ---------------------------------------------------------------------------
 
-class TokenRoutedGPT(nn.Module):
+class DenseGPT(nn.Module):
     def __init__(self,
                  vocab_size: int,
                  seq_len: int,
@@ -228,18 +162,14 @@ class TokenRoutedGPT(nn.Module):
                  n_head: int,
                  n_kv_head: int,
                  n_embd: int,
-                 intermediate_size: int,
-                 num_experts: int,
-                 shared_intermediate_size: int):
+                 intermediate_size: int):
         super().__init__()
         self.vocab_size = vocab_size
         self.n_layer = n_layer
 
         self.embed = nn.Embedding(vocab_size, n_embd)
         self.blocks = nn.ModuleList([
-            Block(n_embd, n_head, n_kv_head,
-                  intermediate_size, num_experts,
-                  shared_intermediate_size, vocab_size, seq_len)
+            Block(n_embd, n_head, n_kv_head, intermediate_size, seq_len)
             for _ in range(n_layer)
         ])
         self.norm = RMSNorm(n_embd)
@@ -250,7 +180,7 @@ class TokenRoutedGPT(nn.Module):
         self.apply(self._init_weights)
         # Rescale output projections for deep nets
         for name, p in self.named_parameters():
-            if name.endswith(("o_proj.weight", "down_proj_w", "shared_down.weight")):
+            if name.endswith(("o_proj.weight", "down_proj.weight")):
                 with torch.no_grad():
                     p.mul_(1.0 / math.sqrt(2 * n_layer))
 
@@ -263,7 +193,7 @@ class TokenRoutedGPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.embed(idx)
         for block in self.blocks:
-            x = block(x, idx)
+            x = block(x)
         x = self.norm(x)
         logits = self.lm_head(x)
 
@@ -282,19 +212,17 @@ class TokenRoutedGPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 def get_model(config: dict) -> nn.Module:
-    """Instantiate the Token-Routed MoE model from a config dict.
+    """Instantiate the dense GPT from a config dict.
 
-    Default: ~111M params (n_embd=768, 12 layers, 4 routed experts + shared).
+    Default: ~111M params (n_embd=768, 12 layers, GQA 12/4, SwiGLU inter=2432).
     Sized for 10-minute training runs on a multi-node cluster.
     """
-    return TokenRoutedGPT(
-        vocab_size               = config.get("vocab_size", 32768),
-        seq_len                  = config.get("seq_len", 1024),
-        n_layer                  = config.get("n_layer", 12),
-        n_head                   = config.get("n_head", 12),
-        n_kv_head                = config.get("n_kv_head", 4),
-        n_embd                   = config.get("n_embd", 768),
-        intermediate_size        = config.get("intermediate_size", 2048),
-        num_experts              = config.get("num_experts", 4),
-        shared_intermediate_size = config.get("shared_intermediate_size", 384),
+    return DenseGPT(
+        vocab_size        = config.get("vocab_size", 32768),
+        seq_len           = config.get("seq_len", 1024),
+        n_layer           = config.get("n_layer", 12),
+        n_head            = config.get("n_head", 12),
+        n_kv_head         = config.get("n_kv_head", 4),
+        n_embd            = config.get("n_embd", 768),
+        intermediate_size = config.get("intermediate_size", 2432),
     )

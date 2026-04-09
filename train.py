@@ -256,9 +256,9 @@ def wsd_factor(step: int, warmup: int, max_steps: int, min_ratio: float,
 
 
 def lr_factor(step: int, warmup: int, max_steps: int, min_ratio: float,
-              scheduler: str = "cosine") -> float:
+              scheduler: str = "cosine", decay_start_frac: float = 0.8) -> float:
     if scheduler == "wsd":
-        return wsd_factor(step, warmup, max_steps, min_ratio)
+        return wsd_factor(step, warmup, max_steps, min_ratio, decay_start_frac)
     return cosine_factor(step, warmup, max_steps, min_ratio)
 
 
@@ -308,6 +308,10 @@ def main():
     parser.add_argument("--scheduler", type=str, default="wsd",
                         choices=["cosine", "wsd"],
                         help="LR schedule: cosine (smooth) or wsd (flat + sqrt decay)")
+    parser.add_argument("--decay_start_frac", type=float, default=0.8,
+                        help="WSD decay starts at max_steps × this fraction")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1,
+                        help="Final LR = max_lr × min_lr_ratio")
     args = parser.parse_args()
 
     cfg = Config(
@@ -324,6 +328,7 @@ def main():
         grad_accum_steps   = args.grad_accum_steps,
         muon_lr            = args.muon_lr,
         max_lr             = args.adam_lr,
+        min_lr_ratio       = args.min_lr_ratio,
         warmup_steps       = args.warmup_steps,
         max_steps          = args.max_steps,
         time_limit_seconds = args.time_limit_min * 60,
@@ -430,8 +435,12 @@ def main():
         adam_p = sum(p.numel() for g in adam_groups for p in g["params"])
         print(f"[opt] Muon: {muon_p/1e6:.0f}M params, AdamW: {adam_p/1e6:.0f}M params",
               flush=True)
-        print(f"[sched] {args.scheduler} (warmup={cfg.warmup_steps}, "
-              f"min_ratio={cfg.min_lr_ratio})", flush=True)
+        sched_info = (f"[sched] {args.scheduler} (warmup={cfg.warmup_steps}, "
+                      f"min_ratio={cfg.min_lr_ratio}")
+        if args.scheduler == "wsd":
+            sched_info += f", decay_start={args.decay_start_frac}"
+        sched_info += ")"
+        print(sched_info, flush=True)
 
     # ------------------------------------------------------------------ Data
     dataset = BinDataset(cfg.data_dir, cfg.seq_len, cfg.token_dtype)
@@ -464,7 +473,8 @@ def main():
 
         # LR schedule
         factor = lr_factor(step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio,
-                           scheduler=args.scheduler)
+                           scheduler=args.scheduler,
+                           decay_start_frac=args.decay_start_frac)
         for g in muon.param_groups:
             g["lr"] = g["lr_base"] * factor
         for g in adam.param_groups:

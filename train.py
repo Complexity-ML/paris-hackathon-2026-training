@@ -44,13 +44,13 @@ class Config:
     token_dtype: str = "uint16"
     seq_len:     int = 1024
 
-    # Model — ~111M params target (dense GPT with GQA + SwiGLU)
+    # Model — ~77M params target (smaller = more steps in 10 min)
     vocab_size:        int = 32768
     n_layer:           int = 12
-    n_head:            int = 12
-    n_kv_head:         int = 4
-    n_embd:            int = 768
-    intermediate_size: int = 2432
+    n_head:            int = 8
+    n_kv_head:         int = 2
+    n_embd:            int = 640
+    intermediate_size: int = 1920
 
     # Training
     batch_size:       int   = 16
@@ -257,10 +257,10 @@ def main():
     parser.add_argument("--seq_len",           type=int,   default=1024)
     parser.add_argument("--vocab_size",        type=int,   default=32768)
     parser.add_argument("--n_layer",           type=int,   default=12)
-    parser.add_argument("--n_head",            type=int,   default=12)
-    parser.add_argument("--n_kv_head",         type=int,   default=4)
-    parser.add_argument("--n_embd",            type=int,   default=768)
-    parser.add_argument("--intermediate_size", type=int,   default=2432)
+    parser.add_argument("--n_head",            type=int,   default=8)
+    parser.add_argument("--n_kv_head",         type=int,   default=2)
+    parser.add_argument("--n_embd",            type=int,   default=640)
+    parser.add_argument("--intermediate_size", type=int,   default=1920)
     parser.add_argument("--batch_size",        type=int,   default=16)
     parser.add_argument("--grad_accum_steps",  type=int,   default=2)
     parser.add_argument("--muon_lr",           type=float, default=0.02)
@@ -273,6 +273,8 @@ def main():
     parser.add_argument("--fp8_recipe", type=str, default="tensorwise",
                         choices=["tensorwise", "rowwise"],
                         help="FP8 scaling recipe (tensorwise faster, rowwise more stable)")
+    parser.add_argument("--compile", action="store_true", default=False,
+                        help="Enable torch.compile for the forward/backward path")
     args = parser.parse_args()
 
     cfg = Config(
@@ -358,6 +360,18 @@ def main():
 
     if ddp:
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+
+    # torch.compile — trace + fuse the forward for extra throughput.
+    # Mode "reduce-overhead" uses CUDA graphs for small steady-state step
+    # time. "default" is safer if graphs don't capture cleanly.
+    if args.compile:
+        try:
+            model = torch.compile(model, mode="default")
+            if master:
+                print("[compile] torch.compile enabled (mode=default)", flush=True)
+        except Exception as e:
+            if master:
+                print(f"[compile] failed: {e}", flush=True)
 
     # ------------------------------------------------------------------ Optimizer
     raw_model = model.module if ddp else model

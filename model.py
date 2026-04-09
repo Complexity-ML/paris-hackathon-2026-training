@@ -221,15 +221,16 @@ class DenseGPT(nn.Module):
 def get_model(config: dict) -> nn.Module:
     """Instantiate the dense GPT from a config dict.
 
-    Default: ~111M params (n_embd=768, 12 layers, GQA 12/4, SwiGLU inter=2432).
-    Sized for 10-minute training runs on a multi-node cluster.
+    Default: ~77M params (n_embd=640, 12 layers, GQA 8/2, SquaredReluGLU 1920).
+    Sized for 10-minute training runs — smaller model → more steps → lower
+    final loss in a compute-constrained regime.
     """
     return DenseGPT(
         vocab_size        = config.get("vocab_size", 32768),
         seq_len           = config.get("seq_len", 1024),
         n_layer           = config.get("n_layer", 12),
-        n_head            = config.get("n_head", 12),
-        n_kv_head         = config.get("n_kv_head", 4),
-        n_embd            = config.get("n_embd", 768),
-        intermediate_size = config.get("intermediate_size", 2432),
+        n_head            = config.get("n_head", 8),
+        n_kv_head         = config.get("n_kv_head", 2),
+        n_embd            = config.get("n_embd", 640),
+        intermediate_size = config.get("intermediate_size", 1920),
     )

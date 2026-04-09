@@ -1,13 +1,12 @@
 """
-Training script for Token-Routed MoE with MuonTR optimizer.
+Training script for the dense hackathon GPT with Muon optimizer.
 
 10-minute time-budgeted training on a SLURM multi-node DDP cluster.
 Writes `checkpoint.pt` at the end of training or on time-out.
 
 Design choices:
-    - MuonTR (per-expert Newton-Schulz orthogonalization) on 2D+ weights
+    - Muon (Newton-Schulz orthogonalization) on 2D weights
     - AdamW for embeddings, norms, and 1D params
-    - Per-expert adaptive LR controller (EMA-smoothed token-count ratio)
     - Linear warmup → cosine decay LR schedule
     - BF16 mixed precision via torch.amp.autocast
     - DDP across all ranks, grad accumulation for big effective batch
@@ -57,12 +56,11 @@ class Config:
     batch_size:       int   = 16
     grad_accum_steps: int   = 2
     max_lr:           float = 3e-4       # AdamW LR for embeds / norms
-    muon_lr:          float = 0.02       # MuonTR LR for 2D+ weights
+    muon_lr:          float = 0.02       # Muon LR for 2D weights
     min_lr_ratio:     float = 0.1        # final LR = max_lr * min_lr_ratio
     warmup_steps:     int   = 50
     max_steps:        int   = 100_000    # hard cap — time limit is the real stop
     weight_decay:     float = 0.1
-    expert_weight_decay: float = 0.005
     grad_clip:        float = 1.0
     time_limit_seconds: float = 10 * 60
 
@@ -71,7 +69,8 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
-# MuonTR optimizer — Muon with per-expert Newton-Schulz + adaptive LR
+# Muon optimizer — Momentum Orthogonalized by Newton-Schulz
+# Keller Jordan's Muon, minimal implementation.
 # ---------------------------------------------------------------------------
 
 def _newton_schulz(M: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -87,16 +86,11 @@ def _newton_schulz(M: torch.Tensor, steps: int = 5) -> torch.Tensor:
     return X.to(M.dtype)
 
 
-class MuonTR(torch.optim.Optimizer):
-    """
-    MuonTR: Muon with per-expert Newton-Schulz for 3D expert tensors [E, H, I]
-    and standard Muon for 2D weights.
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer for 2D weight matrices.
 
-    Features:
-        - Per-expert NS orthogonalization (each expert slice independently)
-        - Adaptive per-expert LR: target[i] = max(1, mean_count / count[i])
-          EMA-smoothed over ~500 steps, clamped to [1, max_lr_ratio]
-        - Expert-aware weight decay (lighter on routed experts)
+    Each step: momentum → Nesterov lookahead → Newton-Schulz orthogonalization
+    → scaled weight decay + update. Non-2D params should go to AdamW.
     """
 
     def __init__(
@@ -107,40 +101,12 @@ class MuonTR(torch.optim.Optimizer):
         nesterov: bool = True,
         ns_steps: int = 5,
         weight_decay: float = 0.01,
-        expert_lr_scale: float = 1.5,
-        expert_weight_decay: float = 0.005,
-        num_experts: int = 4,
-        ema_decay: float = 0.998,
-        max_lr_ratio: float = 4.0,
     ):
         defaults = dict(
-            lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps,
-            weight_decay=weight_decay, expert_lr_scale=expert_lr_scale,
-            expert_weight_decay=expert_weight_decay,
+            lr=lr, momentum=momentum, nesterov=nesterov,
+            ns_steps=ns_steps, weight_decay=weight_decay,
         )
         super().__init__(params, defaults)
-        self.num_experts = num_experts
-        self.ema_decay = ema_decay
-        self.max_lr_ratio = max_lr_ratio
-        self.token_counts: Optional[torch.Tensor] = None
-        self._lr_ratio_ema: Optional[torch.Tensor] = None
-
-    def update_token_counts(self, counts: torch.Tensor):
-        self.token_counts = counts
-
-    def _compute_lr_ratio(self, device: torch.device) -> torch.Tensor:
-        if self.token_counts is None:
-            return torch.ones(self.num_experts, device=device)
-        c = self.token_counts.float().to(device)
-        mean = c.mean()
-        target = (mean / c.clamp(min=1.0)).clamp(min=1.0, max=self.max_lr_ratio)
-        if self._lr_ratio_ema is None or self._lr_ratio_ema.device != device:
-            self._lr_ratio_ema = target.clone()
-        else:
-            self._lr_ratio_ema.mul_(self.ema_decay).add_(
-                target, alpha=1.0 - self.ema_decay
-            )
-        return self._lr_ratio_ema
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -154,7 +120,8 @@ class MuonTR(torch.optim.Optimizer):
             beta = group["momentum"]
             nesterov = group["nesterov"]
             ns_steps = group["ns_steps"]
-            ptype = group.get("param_type", "dense")
+            wd = group["weight_decay"]
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -163,46 +130,28 @@ class MuonTR(torch.optim.Optimizer):
                 if "buf" not in state:
                     state["buf"] = torch.zeros_like(grad)
                 buf = state["buf"]
+
+                # Momentum + Nesterov
                 buf.lerp_(grad, 1 - beta)
                 update = grad.lerp(buf, beta) if nesterov else buf.clone()
 
-                # Expert LR scale applied per-group
-                eff_lr = lr * (group["expert_lr_scale"] if ptype == "expert" else 1.0)
-                wd = group["expert_weight_decay"] if ptype == "expert" else group["weight_decay"]
-
-                # Per-expert ortho for [E, H, I] tensors
-                if (p.dim() == 3 and p.shape[0] == self.num_experts and ptype == "expert"):
-                    per_expert_lr = self._compute_lr_ratio(update.device)
-                    for e in range(self.num_experts):
-                        slice_upd = update[e]
-                        rows, cols = slice_upd.shape
-                        transposed = rows > cols
-                        if transposed:
-                            slice_upd = slice_upd.T
-                        slice_upd = _newton_schulz(slice_upd, steps=ns_steps)
-                        if transposed:
-                            slice_upd = slice_upd.T
-                        slice_upd *= max(1.0, rows / cols) ** 0.5
-                        slice_upd *= per_expert_lr[e].item()
-                        update[e] = slice_upd
-                else:
-                    # Standard Muon for 2D weights
-                    orig_shape = update.shape
-                    if update.ndim > 2:
-                        update = update.view(update.shape[0], -1)
-                    rows, cols = update.shape
-                    transposed = rows > cols
-                    if transposed:
-                        update = update.T
-                    update = _newton_schulz(update, steps=ns_steps)
-                    if transposed:
-                        update = update.T
-                    update = update * (max(1.0, rows / cols) ** 0.5)
-                    update = update.reshape(orig_shape)
+                # Reshape to 2D for NS
+                orig_shape = update.shape
+                if update.ndim > 2:
+                    update = update.view(update.shape[0], -1)
+                rows, cols = update.shape
+                transposed = rows > cols
+                if transposed:
+                    update = update.T
+                update = _newton_schulz(update, steps=ns_steps)
+                if transposed:
+                    update = update.T
+                update = update * (max(1.0, rows / cols) ** 0.5)
+                update = update.reshape(orig_shape)
 
                 if wd != 0:
-                    p.mul_(1 - eff_lr * wd)
-                p.add_(update, alpha=-eff_lr)
+                    p.mul_(1 - lr * wd)
+                p.add_(update, alpha=-lr)
 
         return loss
 
@@ -210,12 +159,10 @@ class MuonTR(torch.optim.Optimizer):
 def split_params_for_muon(model: nn.Module) -> Tuple[List[dict], List[dict]]:
     """Split model parameters into (muon_groups, adamw_groups).
 
-    Muon handles 2D+ weight matrices; AdamW handles 1D params, embeddings,
+    Muon handles 2D weight matrices; AdamW handles 1D params, embeddings,
     norms, and the tied lm_head.
     """
-    expert_params, shared_params, dense_params = [], [], []
-    adam_decay, adam_no_decay = [], []
-
+    muon_params, adam_decay, adam_no_decay = [], [], []
     adam_keywords = ("embed", "lm_head", "norm", "bias")
 
     for name, p in model.named_parameters():
@@ -227,27 +174,15 @@ def split_params_for_muon(model: nn.Module) -> Tuple[List[dict], List[dict]]:
                 adam_no_decay.append(p)
             else:
                 adam_decay.append(p)
-        elif any(k in name for k in ("gate_proj_w", "up_proj_w", "down_proj_w")):
-            expert_params.append(p)
-        elif "shared_" in name:
-            shared_params.append(p)
         else:
-            dense_params.append(p)
+            muon_params.append(p)
 
-    muon_groups = []
-    if expert_params:
-        muon_groups.append({"params": expert_params, "param_type": "expert"})
-    if shared_params:
-        muon_groups.append({"params": shared_params, "param_type": "shared"})
-    if dense_params:
-        muon_groups.append({"params": dense_params, "param_type": "dense"})
-
+    muon_groups = [{"params": muon_params}] if muon_params else []
     adam_groups = []
     if adam_decay:
         adam_groups.append({"params": adam_decay})
     if adam_no_decay:
         adam_groups.append({"params": adam_no_decay, "weight_decay": 0.0})
-
     return muon_groups, adam_groups
 
 
@@ -428,16 +363,13 @@ def main():
     raw_model = model.module if ddp else model
     muon_groups, adam_groups = split_params_for_muon(raw_model)
 
-    muon = MuonTR(
+    muon = Muon(
         muon_groups,
         lr=cfg.muon_lr,
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
         weight_decay=cfg.weight_decay,
-        expert_lr_scale=1.0,
-        expert_weight_decay=cfg.weight_decay,
-        num_experts=1,  # no routed experts in dense model
     )
     adam = torch.optim.AdamW(
         adam_groups,
@@ -449,7 +381,7 @@ def main():
     if master:
         muon_p = sum(p.numel() for g in muon_groups for p in g["params"])
         adam_p = sum(p.numel() for g in adam_groups for p in g["params"])
-        print(f"[opt] MuonTR: {muon_p/1e6:.0f}M params, AdamW: {adam_p/1e6:.0f}M params",
+        print(f"[opt] Muon: {muon_p/1e6:.0f}M params, AdamW: {adam_p/1e6:.0f}M params",
               flush=True)
 
     # ------------------------------------------------------------------ Data

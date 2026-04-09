@@ -44,13 +44,13 @@ class Config:
     token_dtype: str = "uint16"
     seq_len:     int = 1024
 
-    # Model — ~77M params target (smaller = more steps in 10 min)
+    # Model — ~77.5M params (SquaredReluMLP 2-matmul, inter 3/2 scaled)
     vocab_size:        int = 32768
     n_layer:           int = 12
     n_head:            int = 8
     n_kv_head:         int = 2
     n_embd:            int = 640
-    intermediate_size: int = 1920
+    intermediate_size: int = 2880
 
     # Training
     batch_size:       int   = 16
@@ -290,7 +290,7 @@ def main():
     parser.add_argument("--n_head",            type=int,   default=8)
     parser.add_argument("--n_kv_head",         type=int,   default=2)
     parser.add_argument("--n_embd",            type=int,   default=640)
-    parser.add_argument("--intermediate_size", type=int,   default=1920)
+    parser.add_argument("--intermediate_size", type=int,   default=2880)
     parser.add_argument("--batch_size",        type=int,   default=16)
     parser.add_argument("--grad_accum_steps",  type=int,   default=2)
     parser.add_argument("--muon_lr",           type=float, default=0.02)

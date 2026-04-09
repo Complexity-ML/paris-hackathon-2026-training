@@ -18,8 +18,6 @@ Contract:
     model.forward(idx, targets=None) -> (logits, loss)
 """
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -120,22 +118,23 @@ class GQA(nn.Module):
 # Dense SwiGLU MLP
 # ---------------------------------------------------------------------------
 
-class SquaredReluGLU(nn.Module):
-    """Gated MLP with squared-ReLU activation on the gate branch.
+class SquaredReluMLP(nn.Module):
+    """Two-matmul MLP with squared-ReLU activation (Primer-style).
 
-    Replaces SwiGLU's SiLU with ReLU² (no exponential, slightly faster,
-    equivalent or better convergence at this scale). Used in Primer and
-    several Parameter Golf recipes.
+    y = down(relu(up(x))²)
+
+    Drops the GLU gate for a leaner forward path: only two matmuls per
+    layer instead of three. To keep total MLP params comparable to a
+    SwiGLU/GLU variant, `intermediate_size` should be scaled by 3/2.
     """
 
     def __init__(self, n_embd: int, intermediate_size: int):
         super().__init__()
-        self.gate_proj = nn.Linear(n_embd, intermediate_size, bias=False)
         self.up_proj   = nn.Linear(n_embd, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, n_embd, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.relu(self.gate_proj(x)).square() * self.up_proj(x))
+        return self.down_proj(F.relu(self.up_proj(x)).square())
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +148,7 @@ class Block(nn.Module):
         self.input_norm = RMSNorm(n_embd)
         self.attn = GQA(n_embd, n_head, n_kv_head, max_seq_len)
         self.post_attn_norm = RMSNorm(n_embd)
-        self.mlp = SquaredReluGLU(n_embd, intermediate_size)
+        self.mlp = SquaredReluMLP(n_embd, intermediate_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.input_norm(x))
@@ -162,6 +161,20 @@ class Block(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DenseGPT(nn.Module):
+    """Dense transformer with U-Net style skip connections.
+
+    Layer pairing: encoder layer i is skip-connected into decoder layer
+    (n_layer - 1 - i) via a learnable scalar gate, initialized to 0.
+    At init the gates are 0 → network is a plain transformer; as
+    training progresses, the gates learn to route info from early to
+    late layers.
+
+    Zero-init output projections (o_proj and MLP down_proj): residual
+    branches start at exactly zero so the stack is an identity at step 0.
+    Muon converges faster from this init because every update is
+    meaningful (no random noise to cancel).
+    """
+
     def __init__(self,
                  vocab_size: int,
                  seq_len: int,
@@ -184,12 +197,17 @@ class DenseGPT(nn.Module):
         # Weight tying
         self.lm_head.weight = self.embed.weight
 
+        # U-Net skip scalars — one per decoder layer, initialized to 0
+        # (network starts as plain transformer, learns to use skips)
+        self.n_skip = n_layer // 2
+        self.skip_scalars = nn.Parameter(torch.zeros(self.n_skip))
+
         self.apply(self._init_weights)
-        # Rescale output projections for deep nets
+        # Zero-init output projections (muP-like): residual branches = 0 at init
         for name, p in self.named_parameters():
             if name.endswith(("o_proj.weight", "down_proj.weight")):
                 with torch.no_grad():
-                    p.mul_(1.0 / math.sqrt(2 * n_layer))
+                    p.zero_()
 
     def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
@@ -199,8 +217,22 @@ class DenseGPT(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
         x = self.embed(idx)
-        for block in self.blocks:
+
+        # U-Net: run first half as encoder, store outputs;
+        # run second half as decoder, adding learned-scalar-gated skips
+        # from the paired encoder layer.
+        encoder_outputs = []
+        half = self.n_skip  # = n_layer // 2
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            if i < half:
+                encoder_outputs.append(x)
+            else:
+                # Decoder layer i pairs with encoder layer (n_layer - 1 - i)
+                skip_idx = self.n_layer - 1 - i
+                gate = self.skip_scalars[i - half]
+                x = x + gate * encoder_outputs[skip_idx]
+
         x = self.norm(x)
         logits = self.lm_head(x)
 
@@ -221,7 +253,9 @@ class DenseGPT(nn.Module):
 def get_model(config: dict) -> nn.Module:
     """Instantiate the dense GPT from a config dict.
 
-    Default: ~77M params (n_embd=640, 12 layers, GQA 8/2, SquaredReluGLU 1920).
+    Default: ~77.5M params
+        n_embd=640, 12 layers, GQA 8/2, SquaredReluMLP inter=2880.
+    U-Net skip connections (6 encoder ↔ 6 decoder) + zero-init output projs.
     Sized for 10-minute training runs — smaller model → more steps → lower
     final loss in a compute-constrained regime.
     """
@@ -232,5 +266,5 @@ def get_model(config: dict) -> nn.Module:
         n_head            = config.get("n_head", 8),
         n_kv_head         = config.get("n_kv_head", 2),
         n_embd            = config.get("n_embd", 640),
-        intermediate_size = config.get("intermediate_size", 1920),
+        intermediate_size = config.get("intermediate_size", 2880),
     )

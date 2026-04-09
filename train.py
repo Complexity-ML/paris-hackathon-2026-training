@@ -219,10 +219,10 @@ class BinDataset:
 
 
 # ---------------------------------------------------------------------------
-# LR schedule
+# LR schedules
 # ---------------------------------------------------------------------------
 
-def lr_factor(step: int, warmup: int, max_steps: int, min_ratio: float) -> float:
+def cosine_factor(step: int, warmup: int, max_steps: int, min_ratio: float) -> float:
     if step < warmup:
         return (step + 1) / max(1, warmup)
     if step >= max_steps:
@@ -230,6 +230,36 @@ def lr_factor(step: int, warmup: int, max_steps: int, min_ratio: float) -> float
     progress = (step - warmup) / max(1, max_steps - warmup)
     cos = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_ratio + (1.0 - min_ratio) * cos
+
+
+def wsd_factor(step: int, warmup: int, max_steps: int, min_ratio: float,
+               decay_start_frac: float = 0.8) -> float:
+    """Warmup-Stable-Decay schedule (MiniCPM-style with sqrt decay).
+
+    - Linear warmup:  [0, warmup)           → 0 → 1
+    - Stable phase:   [warmup, decay_start) → 1.0
+    - Sqrt decay:     [decay_start, max)    → 1.0 → min_ratio
+
+    Spends most of training at peak LR, then drops sharply at the end.
+    Beats cosine at compute-matched budgets for Muon (see MiniCPM, Zamba).
+    """
+    if step < warmup:
+        return (step + 1) / max(1, warmup)
+    decay_start = int(max_steps * decay_start_frac)
+    if step < decay_start:
+        return 1.0
+    if step >= max_steps:
+        return min_ratio
+    progress = (step - decay_start) / max(1, max_steps - decay_start)
+    # Sqrt-shaped decay: fast at first, slower near the floor
+    return 1.0 - (1.0 - min_ratio) * math.sqrt(progress)
+
+
+def lr_factor(step: int, warmup: int, max_steps: int, min_ratio: float,
+              scheduler: str = "cosine") -> float:
+    if scheduler == "wsd":
+        return wsd_factor(step, warmup, max_steps, min_ratio)
+    return cosine_factor(step, warmup, max_steps, min_ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +305,9 @@ def main():
                         help="FP8 scaling recipe (tensorwise faster, rowwise more stable)")
     parser.add_argument("--compile", action="store_true", default=False,
                         help="Enable torch.compile for the forward/backward path")
+    parser.add_argument("--scheduler", type=str, default="wsd",
+                        choices=["cosine", "wsd"],
+                        help="LR schedule: cosine (smooth) or wsd (flat + sqrt decay)")
     args = parser.parse_args()
 
     cfg = Config(
@@ -397,6 +430,8 @@ def main():
         adam_p = sum(p.numel() for g in adam_groups for p in g["params"])
         print(f"[opt] Muon: {muon_p/1e6:.0f}M params, AdamW: {adam_p/1e6:.0f}M params",
               flush=True)
+        print(f"[sched] {args.scheduler} (warmup={cfg.warmup_steps}, "
+              f"min_ratio={cfg.min_lr_ratio})", flush=True)
 
     # ------------------------------------------------------------------ Data
     dataset = BinDataset(cfg.data_dir, cfg.seq_len, cfg.token_dtype)
@@ -428,7 +463,8 @@ def main():
             break
 
         # LR schedule
-        factor = lr_factor(step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio)
+        factor = lr_factor(step, cfg.warmup_steps, cfg.max_steps, cfg.min_lr_ratio,
+                           scheduler=args.scheduler)
         for g in muon.param_groups:
             g["lr"] = g["lr_base"] * factor
         for g in adam.param_groups:
